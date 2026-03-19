@@ -22,12 +22,31 @@ It supports page size = 1.
 
 import logging
 
+import torch
 import triton
 import triton.language as tl
 
 from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
+_is_gfx95: bool | None = None
+
+
+def _detect_gfx95() -> bool:
+    """Lazy gfx95 detection — CUDA must be initialized before this works."""
+    global _is_gfx95
+    if _is_gfx95 is not None:
+        return _is_gfx95
+    if not _is_hip:
+        _is_gfx95 = False
+        return False
+    try:
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+        _is_gfx95 = "gfx95" in gcn_arch
+    except Exception:
+        _is_gfx95 = False
+    return _is_gfx95
+
 
 logger = logging.getLogger(__name__)
 
@@ -194,8 +213,9 @@ def _decode_att_m_fwd(
     xai_temperature_len=-1,
 ):
     BLOCK = 64
-    # [TODO] work around SGPR limit on MI3xx
-    if _is_hip:
+    if _is_hip and not _detect_gfx95():
+        # Conservative tile size for gfx942 (MI300X/MI325X) due to SGPR pressure.
+        # gfx950 (MI355X) handles BLOCK=64 without SGPR issues.
         BLOCK = 8
     MAX_KV_SPLITS = max_kv_splits
     Lk = k_buffer.shape[-1]
@@ -210,7 +230,7 @@ def _decode_att_m_fwd(
         num_warps = 4
     else:
         num_warps = 2
-        if _is_hip:
+        if _is_hip and not _detect_gfx95():
             num_warps = 1
 
     BLOCK_DMODEL = triton.next_power_of_2(Lk)
@@ -472,8 +492,11 @@ def _decode_grouped_att_m_fwd(
     if _is_hip:
         # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
         # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
-        extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
-        num_stages = 1
+        if _detect_gfx95():
+            extra_kargs = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16, "kpack": 2}
+        else:
+            extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
+            num_stages = 1
 
     _fwd_grouped_kernel_stage1[grid](
         q,
