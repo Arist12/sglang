@@ -27,6 +27,7 @@ def aiter_dsv3_router_gemm(
             y = torch.zeros((M, N), dtype=torch.float32, device=hidden_states.device)
 
     if y is not None:
+        # Use atomic GEMM for router - non-atomic has shared memory issues for small M
         logits = gemm_a16w16_atomic(hidden_states, weight, y=y).to(hidden_states.dtype)
     else:
         logits = gemm_a16w16(hidden_states, weight)
