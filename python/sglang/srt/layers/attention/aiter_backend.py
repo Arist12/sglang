@@ -125,6 +125,7 @@ class AiterAttnBackend(AttentionBackend):
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
         self.topk = topk
+        self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.num_head = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
@@ -135,8 +136,20 @@ class AiterAttnBackend(AttentionBackend):
         self.kv_cache_dtype = model_runner.kv_cache_dtype
 
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
-
-        self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
+        
+        # For AITER MLA decode kernel compatibility, store padded head count if needed
+        # The kernel supports #heads in [16, 128], or (#head, uni_seqlen_qo) = (16*N, 1) where N is in [2, 8)
+        # For decode (uni_seqlen_qo=1), we need N in [2, 8), so padded heads must be in [32, 128] in steps of 16
+        self.num_head_padded = self.num_head
+        if self.use_mla:
+            if self.num_head < 32:
+                # Pad to at least 32 heads (N=2) for decode mode
+                self.num_head_padded = 32
+            elif self.num_head % 16 != 0 or self.num_head > 128:
+                # Round up to next multiple of 16, but cap at 128
+                self.num_head_padded = min(((self.num_head + 15) // 16) * 16, 128)
+            if self.num_head_padded != self.num_head:
+                logger.info(f"AITER MLA decode will pad heads from {self.num_head} to {self.num_head_padded}")
 
         # Get v_head_dim based on model type
         if self.use_mla:
@@ -245,7 +258,8 @@ class AiterAttnBackend(AttentionBackend):
             self.fix_max_split_per_batch = self.max_split_per_batch
 
     def make_mla_decode_meta_data_buffer(self, max_seqlen_qo, batch_size):
-        nhead = self.num_head
+        # Use padded head count for AITER MLA decode kernel compatibility
+        nhead = self.num_head_padded
         dtype = self.kv_cache_dtype
 
         if self.enable_dp_attention:
@@ -2194,28 +2208,81 @@ class AiterAttnBackend(AttentionBackend):
 
             num_kv_splits = self.forward_metadata.num_kv_splits
 
-            mla_decode_fwd(
-                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                k_buffer.view(-1, 1, 1, layer.qk_head_dim),
-                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                self.forward_metadata.qo_indptr,
-                self.forward_metadata.kv_indptr,
-                self.forward_metadata.kv_indices,
-                self.forward_metadata.kv_last_page_len,
-                self.forward_metadata.max_q_len,
-                sm_scale=layer.scaling,
-                logit_cap=layer.logit_cap,
-                work_meta_data=work_metadata,
-                work_indptr=work_indptr,
-                work_info_set=work_info_set,
-                reduce_indptr=reduce_indptr,
-                reduce_final_map=reduce_final_map,
-                reduce_partial_map=reduce_partial_map,
-                q_scale=layer.k_scale if layer.k_scale is not None else self.k_scale,
-                kv_scale=layer.k_scale if layer.k_scale is not None else self.k_scale,
-                intra_batch_mode=intra_batch_mode,
-                num_kv_splits=num_kv_splits,
-            )
+            # Reshape q and o for the kernel call
+            q_reshaped = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+            o_reshaped = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            
+            # Check if we need head padding
+            needs_head_padding = self.num_head_padded != self.num_head
+            
+            if needs_head_padding:
+                # Pad query from original heads to padded heads
+                batch_size = q_reshaped.shape[0]
+                q_padded = torch.zeros(
+                    batch_size, self.num_head_padded, layer.qk_head_dim,
+                    dtype=q_reshaped.dtype, device=q_reshaped.device
+                )
+                q_padded[:, :self.num_head, :] = q_reshaped
+                
+                o_padded = torch.zeros(
+                    batch_size, self.num_head_padded, layer.v_head_dim,
+                    dtype=o_reshaped.dtype, device=o_reshaped.device
+                )
+                
+                # For MLA, k_buffer has 1 KV head. We need to expand it to match padded Q heads
+                # k_buffer shape: [total_tokens, 1, 1, head_dim] -> view as [batch, 1, 1, head_dim]
+                k_buffer_reshaped = k_buffer.view(-1, 1, 1, layer.qk_head_dim)
+                # Expand KV heads to match padded Q heads (repeat the single KV head)
+                k_buffer_padded = k_buffer_reshaped.expand(-1, 1, self.num_head_padded, -1).contiguous()
+                
+                mla_decode_fwd(
+                    q_padded,
+                    k_buffer_padded,
+                    o_padded,
+                    self.forward_metadata.qo_indptr,
+                    self.forward_metadata.kv_indptr,
+                    self.forward_metadata.kv_indices,
+                    self.forward_metadata.kv_last_page_len,
+                    self.forward_metadata.max_q_len,
+                    sm_scale=layer.scaling,
+                    logit_cap=layer.logit_cap,
+                    work_meta_data=work_metadata,
+                    work_indptr=work_indptr,
+                    work_info_set=work_info_set,
+                    reduce_indptr=reduce_indptr,
+                    reduce_final_map=reduce_final_map,
+                    reduce_partial_map=reduce_partial_map,
+                    q_scale=layer.k_scale if layer.k_scale is not None else self.k_scale,
+                    kv_scale=layer.k_scale if layer.k_scale is not None else self.k_scale,
+                    intra_batch_mode=intra_batch_mode,
+                    num_kv_splits=num_kv_splits,
+                )
+                
+                # Slice output back to original head count
+                o_reshaped[:] = o_padded[:, :self.num_head, :]
+            else:
+                mla_decode_fwd(
+                    q_reshaped,
+                    k_buffer.view(-1, 1, 1, layer.qk_head_dim),
+                    o_reshaped,
+                    self.forward_metadata.qo_indptr,
+                    self.forward_metadata.kv_indptr,
+                    self.forward_metadata.kv_indices,
+                    self.forward_metadata.kv_last_page_len,
+                    self.forward_metadata.max_q_len,
+                    sm_scale=layer.scaling,
+                    logit_cap=layer.logit_cap,
+                    work_meta_data=work_metadata,
+                    work_indptr=work_indptr,
+                    work_info_set=work_info_set,
+                    reduce_indptr=reduce_indptr,
+                    reduce_final_map=reduce_final_map,
+                    reduce_partial_map=reduce_partial_map,
+                    q_scale=layer.k_scale if layer.k_scale is not None else self.k_scale,
+                    kv_scale=layer.k_scale if layer.k_scale is not None else self.k_scale,
+                    intra_batch_mode=intra_batch_mode,
+                    num_kv_splits=num_kv_splits,
+                )
         else:
             self.logits_soft_cap = layer.logit_cap
 
