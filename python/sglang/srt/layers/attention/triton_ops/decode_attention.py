@@ -504,7 +504,7 @@ def _decode_grouped_att_m_fwd(
         MIN_BLOCK_KV=_MIN_BLOCK_KV,
         logit_cap=logit_cap,
         xai_temperature_len=xai_temperature_len,
-        num_warps=4,
+        num_warps=2,
         num_stages=num_stages,
         Lk=Lk,
         Lv=Lv,
