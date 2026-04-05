@@ -190,13 +190,28 @@ def get_default_config(
             "GROUP_SIZE_M": 8,
         }
         # A heuristic: fused marlin works faster with this config for small M
+        # For AMD MI300X/MI355X with int8_w8a16, use larger BLOCK_SIZE_K for MFMA efficiency
         if M <= E or (is_marlin and M <= 32):
-            config = {
-                "BLOCK_SIZE_M": 16,
-                "BLOCK_SIZE_N": 32,
-                "BLOCK_SIZE_K": 64,
-                "GROUP_SIZE_M": 1,
-            }
+            if _is_hip:
+                # AMD-optimized config for small-M decode (batch=1)
+                config = {
+                    "BLOCK_SIZE_M": 16,
+                    "BLOCK_SIZE_N": 16,
+                    "BLOCK_SIZE_K": 256,
+                    "GROUP_SIZE_M": 1,
+                    "num_warps": 2,
+                    "num_stages": 2,
+                    "waves_per_eu": 0,
+                    "matrix_instr_nonkdim": 16,
+                    "kpack": 2,
+                }
+            else:
+                config = {
+                    "BLOCK_SIZE_M": 16,
+                    "BLOCK_SIZE_N": 32,
+                    "BLOCK_SIZE_K": 64,
+                    "GROUP_SIZE_M": 1,
+                }
     return config
 
 
