@@ -53,6 +53,12 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
 
+# aiter's fp8_mqa_logits only compiles below 2 GiB of fp32 logits; see the
+# comment in IndexerKPool._fp8_mqa_logits.
+_MQA_LOGITS_MAX_BYTES_ROCM = 2**31 - 1
+_MQA_LOGITS_BYTES_PER_ELEM = 4  # float32 logits
+
+
 class IndexerKPool(MultiPlatformOp):
     def __init__(
         self,
@@ -179,6 +185,48 @@ class IndexerKPool(MultiPlatformOp):
     ) -> torch.Tensor:
         if is_hip():
             from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+
+            # aiter's fp8_mqa_logits selects the AMD buffer_store instruction
+            # only while the fp32 [num_q x num_k] logits tensor fits a 32-bit
+            # byte offset. Above 2 GiB it takes a gl.store fallback that fails
+            # to COMPILE -- an LLVM assertion (`Begin <= End`,
+            # llvm/ADT/Sequence.h:275) that abort()s the process rather than
+            # raising, so every TP rank dies (ROCm/aiter#5114).
+            #
+            # Nothing bounds that tensor on this path: _should_chunk_mqa_logits
+            # exists in this file but has no callers, and there is no chunked
+            # implementation behind it. The shape is reachable in ordinary
+            # serving -- at --chunked-prefill-size 8192 the limit is
+            # num_k = 65535, which a long agentic context passes.
+            #
+            # Split the QUERY dimension. That is exact, not an approximation:
+            # output row i depends only on q_fp8[i], weights[i], starts[i],
+            # ends[i] and the whole KV, so blocking over rows and concatenating
+            # reproduces the unsplit result bit for bit.
+            num_q = q_fp8.shape[0]
+            num_k = k_fp8.shape[0]
+            max_rows = (
+                _MQA_LOGITS_MAX_BYTES_ROCM
+                // (num_k * _MQA_LOGITS_BYTES_PER_ELEM)
+                if num_k > 0
+                else num_q
+            )
+            if 0 < max_rows < num_q:
+                return torch.cat(
+                    [
+                        fp8_mqa_logits(
+                            q_fp8[i : i + max_rows],
+                            k_fp8,
+                            k_scale,
+                            weights[i : i + max_rows],
+                            starts[i : i + max_rows],
+                            ends[i : i + max_rows],
+                            clean_logits=clean_logits,
+                        )
+                        for i in range(0, num_q, max_rows)
+                    ],
+                    dim=0,
+                )
 
             return fp8_mqa_logits(
                 q_fp8,
